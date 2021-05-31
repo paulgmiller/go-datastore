@@ -23,10 +23,10 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
-	"github.com/ethereum/go-ethereum/log"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
 )
@@ -154,24 +154,39 @@ func (d *datastore) Query(q query.Query) (query.Results, error) {
 	go func() {
 		var marker azblob.Marker
 		var wg sync.WaitGroup
+		prefix := ""
+		//todo handle these better by remove /./ and going up a level for /../
+		if !(strings.Contains(q.Prefix, "/./") || strings.Contains(q.Prefix, "/../")) {
+			prefix = q.Prefix
+		}
 		for marker.NotDone() {
-			list, err := d.containerUrl.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{})
+			list, err := d.containerUrl.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{
+				Prefix: prefix,
+			})
 			if err != nil {
-				//TODO how do we get this error out?
-				log.Errorf("query failed with %s", err.Error())
+				results <- query.Result{
+					Error: err,
+				}
 				close(results)
 			}
 			for _, blob := range list.Segment.BlobItems {
 				var result query.Result
 				key := ds.NewKey(blob.Name)
-				result.Entry.Key = key.String()
-				result.Entry.Size = int(*blob.Properties.ContentLength)
-				//filer the
+				result.Key = key.String()
+				for _, f := range q.Filters {
+					if keyfilter, ok := f.(query.FilterKeyCompare); ok {
+						if !keyfilter.Filter(result.Entry) {
+							continue
+						}
+					}
+				}
+				result.Size = int(*blob.Properties.ContentLength)
+
 				if !q.KeysOnly {
 					wg.Add(1)
 					go func() {
 						defer wg.Done()
-						result.Entry.Value, result.Error = d.Get(key)
+						result.Value, result.Error = d.Get(key)
 						//don't trust content length? could verify here
 						//result.Entry.Size = len(result.Entry.Value)
 						results <- result
