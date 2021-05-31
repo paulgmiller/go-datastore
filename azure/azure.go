@@ -21,17 +21,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
 )
-
-var ObjectKeySuffix = ".dsobject"
 
 // Datastore uses a uses a file per key to store values.
 type datastore struct {
@@ -40,12 +36,18 @@ type datastore struct {
 
 // NewDatastore returns a new fs Datastore at given `path`
 func NewDatastore(accountName, accountKey, container string) (ds.Datastore, error) {
-	u, _ := url.Parse(fmt.Sprintf("https://%s.blob.core.windows.net/mycontainer", accountName))
+	u, _ := url.Parse(fmt.Sprintf("https://%s.blob.core.windows.net/%s", accountName, container))
 	credential, err := azblob.NewSharedKeyCredential(accountName, accountKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return &datastore{containerUrl: azblob.NewContainerURL(*u, azblob.NewPipeline(credential, azblob.PipelineOptions{}))}, nil
+	curl := azblob.NewContainerURL(*u, azblob.NewPipeline(credential, azblob.PipelineOptions{}))
+	create, err := curl.Create(context.TODO(), azblob.Metadata{}, azblob.PublicAccessNone)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println(create.Status())
+	return &datastore{containerUrl: curl}, nil
 }
 
 // KeyFilename returns the filename associated with `key`
@@ -58,7 +60,7 @@ func (d *datastore) Put(key ds.Key, value []byte) (err error) {
 	blob := d.keyUrl(key)
 	ctx := context.TODO()
 	//block if exists?
-	put, err = blob.Upload(ctx, bytes.NewReader(value), azblob.BlobHTTPHeaders{}, azblob.Metadata{},
+	put, err := blob.Upload(ctx, bytes.NewReader(value), azblob.BlobHTTPHeaders{}, azblob.Metadata{},
 		azblob.BlobAccessConditions{}, azblob.AccessTierCool, nil, azblob.ClientProvidedKeyOptions{})
 	// put into go routine an only block on sync
 	// check _ respoonse.statuscode?
@@ -76,9 +78,16 @@ func (d *datastore) Sync(prefix ds.Key) error {
 func (d *datastore) Get(key ds.Key) (value []byte, err error) {
 	blob := d.keyUrl(key)
 	ctx := context.TODO()
-	//block if exists?
-	_, err = blob.Download(ctx, bytes.NewReader(value), azblob.BlobHTTPHeaders{}, azblob.Metadata{},
-		azblob.BlobAccessConditions{}, azblob.AccessTierCool, nil, azblob.ClientProvidedKeyOptions{})
+	//presize buffer
+	get, err := blob.Download(ctx, 0, 0, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
+	if err != nil {
+		return nil, err
+	}
+	b := bytes.Buffer{}
+	reader := get.Body(azblob.RetryReaderOptions{})
+	defer reader.Close()
+	b.ReadFrom(reader)
+	return b.Bytes(), nil
 }
 
 // Has returns whether the datastore has a value for a given key
@@ -86,16 +95,24 @@ func (d *datastore) Has(key ds.Key) (exists bool, err error) {
 	blob := d.keyUrl(key)
 	ctx := context.TODO()
 	//block if exists?
-	get, err = blob.GetMetadata()
-	ctx, 0, 0, BlobAccessConditions{}, false, ClientProvidedKeyOptions{})
-b := bytes.Buffer{}
-reader := get.Body(RetryReaderOptions{})
-b.ReadFrom(reader)
-reader.Clo
+	prop, err := blob.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+	if err != nil {
+		return false, err
+	}
+	fmt.Println(prop.Status())
+	return prop.StatusCode() == http.StatusOK, nil
 }
 
 func (d *datastore) GetSize(key ds.Key) (size int, err error) {
-	return ds.GetBackedSize(d, key)
+	blob := d.keyUrl(key)
+	ctx := context.TODO()
+	//block if exists?
+	prop, err := blob.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+	if err != nil {
+		return 0, err
+	}
+	fmt.Println(prop.Status())
+	return int(prop.ContentLength()), nil
 }
 
 // Delete removes the value for given key
@@ -103,37 +120,15 @@ func (d *datastore) Delete(key ds.Key) (err error) {
 	blob := d.keyUrl(key)
 	ctx := context.TODO()
 	//block if exists?
-	_, err = blob.Delete(ctx)
+	del, err := blob.Delete(ctx, azblob.DeleteSnapshotsOptionInclude, azblob.BlobAccessConditions{})
+	fmt.Println(del.Status())
+	return err
 }
 
 // Query implements Datastore.Query
 func (d *datastore) Query(q query.Query) (query.Results, error) {
 	results := make(chan query.Result)
 
-	walkFn := func(path string, info os.FileInfo, _ error) error {
-		// remove ds path prefix
-		relPath, err := filepath.Rel(d.path, path)
-		if err == nil {
-			path = filepath.ToSlash(relPath)
-		}
-
-		if !info.IsDir() {
-			path = strings.TrimSuffix(path, ObjectKeySuffix)
-			var result query.Result
-			key := ds.NewKey(path)
-			result.Entry.Key = key.String()
-			if !q.KeysOnly {
-				result.Entry.Value, result.Error = d.Get(key)
-			}
-			results <- result
-		}
-		return nil
-	}
-
-	go func() {
-		filepath.Walk(d.path, walkFn)
-		close(results)
-	}()
 	r := query.ResultsWithChan(q, results)
 	r = query.NaiveQueryApply(q, r)
 	return r, nil
@@ -149,5 +144,6 @@ func (d *datastore) Batch() (ds.Batch, error) {
 
 // DiskUsage returns the disk size used by the datastore in bytes.
 func (d *datastore) DiskUsage() (uint64, error) {
+	//should we just not implment this?
 	return 100, nil
 }
