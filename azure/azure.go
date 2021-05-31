@@ -20,9 +20,10 @@ package azure
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
+	"sync"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	ds "github.com/ipfs/go-datastore"
@@ -32,6 +33,7 @@ import (
 // Datastore uses a uses a file per key to store values.
 type datastore struct {
 	containerUrl azblob.ContainerURL
+	putcache     map[string]struct{}
 }
 
 // NewDatastore returns a new fs Datastore at given `path`
@@ -42,12 +44,21 @@ func NewDatastore(accountName, accountKey, container string) (ds.Datastore, erro
 		return nil, err
 	}
 	curl := azblob.NewContainerURL(*u, azblob.NewPipeline(credential, azblob.PipelineOptions{}))
-	create, err := curl.Create(context.TODO(), azblob.Metadata{}, azblob.PublicAccessNone)
+	_, err = curl.Create(context.TODO(), azblob.Metadata{}, azblob.PublicAccessNone)
 	if err != nil {
-		return nil, err
+		if !isError(err, azblob.ServiceCodeContainerAlreadyExists) {
+			return nil, err
+		}
 	}
-	fmt.Println(create.Status())
 	return &datastore{containerUrl: curl}, nil
+}
+
+func isError(err error, e azblob.ServiceCodeType) bool {
+	var serr azblob.StorageError
+	if errors.As(err, &serr) {
+		return serr.ServiceCode() == e
+	}
+	return false
 }
 
 // KeyFilename returns the filename associated with `key`
@@ -60,11 +71,10 @@ func (d *datastore) Put(key ds.Key, value []byte) (err error) {
 	blob := d.keyUrl(key)
 	ctx := context.TODO()
 	//block if exists?
-	put, err := blob.Upload(ctx, bytes.NewReader(value), azblob.BlobHTTPHeaders{}, azblob.Metadata{},
-		azblob.BlobAccessConditions{}, azblob.AccessTierCool, nil, azblob.ClientProvidedKeyOptions{})
+	_, err = blob.Upload(ctx, bytes.NewReader(value), azblob.BlobHTTPHeaders{}, azblob.Metadata{},
+		azblob.BlobAccessConditions{}, azblob.AccessTierNone, nil, azblob.ClientProvidedKeyOptions{})
 	// put into go routine an only block on sync
 	// check _ respoonse.statuscode?
-	fmt.Println(put.Status())
 	return err
 }
 
@@ -81,6 +91,9 @@ func (d *datastore) Get(key ds.Key) (value []byte, err error) {
 	//presize buffer
 	get, err := blob.Download(ctx, 0, 0, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
 	if err != nil {
+		if isError(err, azblob.ServiceCodeBlobNotFound) {
+			return nil, ds.ErrNotFound
+		}
 		return nil, err
 	}
 	b := bytes.Buffer{}
@@ -95,20 +108,24 @@ func (d *datastore) Has(key ds.Key) (exists bool, err error) {
 	blob := d.keyUrl(key)
 	ctx := context.TODO()
 	//block if exists?
-	prop, err := blob.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
+	_, err = blob.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
 	if err != nil {
+		if isError(err, azblob.ServiceCodeBlobNotFound) {
+			return false, nil
+		}
 		return false, err
 	}
-	fmt.Println(prop.Status())
-	return prop.StatusCode() == http.StatusOK, nil
+	return true, nil
 }
-
 func (d *datastore) GetSize(key ds.Key) (size int, err error) {
 	blob := d.keyUrl(key)
 	ctx := context.TODO()
 	//block if exists?
 	prop, err := blob.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
 	if err != nil {
+		if isError(err, azblob.ServiceCodeBlobNotFound) {
+			return 0, ds.ErrNotFound
+		}
 		return 0, err
 	}
 	fmt.Println(prop.Status())
@@ -120,17 +137,48 @@ func (d *datastore) Delete(key ds.Key) (err error) {
 	blob := d.keyUrl(key)
 	ctx := context.TODO()
 	//block if exists?
-	del, err := blob.Delete(ctx, azblob.DeleteSnapshotsOptionInclude, azblob.BlobAccessConditions{})
-	fmt.Println(del.Status())
-	return err
+	_, err = blob.Delete(ctx, azblob.DeleteSnapshotsOptionInclude, azblob.BlobAccessConditions{})
+	if !isError(err, azblob.ServiceCodeBlobNotFound) {
+		return err
+	}
+	return nil
+
 }
 
 // Query implements Datastore.Query
 func (d *datastore) Query(q query.Query) (query.Results, error) {
 	results := make(chan query.Result)
 
+	go func() {
+		var marker azblob.Marker
+
+		list, err := d.containerUrl.ListBlobsFlatSegment(context.TODO(), marker, azblob.ListBlobsSegmentOptions{})
+		if err != nil {
+			close(results)
+		}
+		var wg sync.WaitGroup
+		for _, blob := range list.Segment.BlobItems {
+			var result query.Result
+			key := ds.NewKey(blob.Name)
+			result.Entry.Key = key.String()
+			if !q.KeysOnly {
+				wg.Add(1)
+				go func() {
+					result.Entry.Value, result.Error = d.Get(key)
+					results <- result
+					wg.Done()
+				}()
+			} else {
+				results <- result
+			}
+			//this is slow as shit
+		}
+		wg.Wait()
+		close(results)
+	}()
 	r := query.ResultsWithChan(q, results)
 	r = query.NaiveQueryApply(q, r)
+
 	return r, nil
 }
 
