@@ -26,6 +26,7 @@ import (
 	"sync"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/ethereum/go-ethereum/log"
 	ds "github.com/ipfs/go-datastore"
 	query "github.com/ipfs/go-datastore/query"
 )
@@ -124,7 +125,7 @@ func (d *datastore) GetSize(key ds.Key) (size int, err error) {
 	prop, err := blob.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
 	if err != nil {
 		if isError(err, azblob.ServiceCodeBlobNotFound) {
-			return 0, ds.ErrNotFound
+			return -1, ds.ErrNotFound
 		}
 		return 0, err
 	}
@@ -148,33 +149,42 @@ func (d *datastore) Delete(key ds.Key) (err error) {
 // Query implements Datastore.Query
 func (d *datastore) Query(q query.Query) (query.Results, error) {
 	results := make(chan query.Result)
+	ctx := context.TODO()
 
 	go func() {
 		var marker azblob.Marker
-
-		list, err := d.containerUrl.ListBlobsFlatSegment(context.TODO(), marker, azblob.ListBlobsSegmentOptions{})
-		if err != nil {
-			close(results)
-		}
 		var wg sync.WaitGroup
-		for _, blob := range list.Segment.BlobItems {
-			var result query.Result
-			key := ds.NewKey(blob.Name)
-			result.Entry.Key = key.String()
-			if !q.KeysOnly {
-				wg.Add(1)
-				go func() {
-					result.Entry.Value, result.Error = d.Get(key)
-					results <- result
-					wg.Done()
-				}()
-			} else {
-				results <- result
+		for marker.NotDone() {
+			list, err := d.containerUrl.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{})
+			if err != nil {
+				//TODO how do we get this error out?
+				log.Errorf("query failed with %s", err.Error())
+				close(results)
 			}
-			//this is slow as shit
+			for _, blob := range list.Segment.BlobItems {
+				var result query.Result
+				key := ds.NewKey(blob.Name)
+				result.Entry.Key = key.String()
+				result.Entry.Size = int(*blob.Properties.ContentLength)
+				//filer the
+				if !q.KeysOnly {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						result.Entry.Value, result.Error = d.Get(key)
+						//don't trust content length? could verify here
+						//result.Entry.Size = len(result.Entry.Value)
+						results <- result
+					}()
+				} else {
+					results <- result
+				}
+			}
+			marker = list.NextMarker
 		}
 		wg.Wait()
 		close(results)
+
 	}()
 	r := query.ResultsWithChan(q, results)
 	r = query.NaiveQueryApply(q, r)
